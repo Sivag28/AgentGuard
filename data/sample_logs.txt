@@ -1,0 +1,11 @@
+
+TEST RUN: 001
+test_login: PASS
+test_payment: FAIL
+ERROR: Payment service returned HTTP 500
+test_profile: PASS
+test_search: FAIL
+ERROR: Search service timed out
+TOTAL: 4
+PASSED: 2
+FAILED: 2

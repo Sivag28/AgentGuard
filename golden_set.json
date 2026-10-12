@@ -1,0 +1,26 @@
+[
+  {
+    "id": "REAL01",
+    "task": "Inspect the CI log and identify the environment setup failure and requested Python version.",
+    "expected_answer_contains": ["PackagesNotFoundError", "python=3.4"],
+    "expected_tools": ["search_logs"]
+  },
+  {
+    "id": "REAL02",
+    "task": "Find the troubleshooting documentation for this package resolution failure and summarize its likely cause.",
+    "expected_answer_contains": ["Python 3.4", "scipy"],
+    "expected_tools": ["search_docs"]
+  },
+  {
+    "id": "REAL03",
+    "task": "Does this CI log contain exact test totals? Report whether TOTAL, PASSED, and FAILED counts are available.",
+    "expected_answer_contains": ["not", "available"],
+    "expected_tools": ["get_test_summary"]
+  },
+  {
+    "id": "REAL04",
+    "task": "Search for the exact error line that begins with PackagesNotFoundError and quote it exactly.",
+    "expected_answer_contains": ["PackagesNotFoundError"],
+    "expected_tools": ["search_logs"]
+  }
+]
