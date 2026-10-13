@@ -2,13 +2,55 @@
 
 import json
 import html
+import hashlib
 import re
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import streamlit as st
 
 from agent import MODEL, run_agent
-from tools import MAX_FILE_BYTES, get_log_context, get_test_summary, list_allowed_files, validate_log_text
+from tools import MAX_FILE_BYTES, get_log_context, get_test_summary, validate_log_text
+
+
+REPORT_HISTORY_PATH = Path(__file__).resolve().parent / ".agentguard" / "history.json"
+
+
+def load_saved_reports() -> list[dict]:
+    """Load locally saved report records; uploaded source logs are never stored here."""
+    try:
+        payload = json.loads(REPORT_HISTORY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def save_report(record: dict) -> None:
+    reports = load_saved_reports()
+    reports = [item for item in reports if item.get("id") != record.get("id")]
+    reports.insert(0, record)
+    REPORT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = REPORT_HISTORY_PATH.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(reports[:100], ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(REPORT_HISTORY_PATH)
+
+
+def log_timeline_events(log_text: str) -> list[tuple[int, str, str]]:
+    """Return exact source lines for failure, retry, recovery, and pipeline events."""
+    event_pattern = re.compile(
+        r"\b(?:FAIL|ERROR|FATAL|WARN|PASS)\b|\bRetry\s+(?:attempt|\d+)|\bPIPELINE\s+BLOCKED\b",
+        re.IGNORECASE,
+    )
+    events = []
+    for line_number, line in enumerate(log_text.splitlines(), start=1):
+        if event_pattern.search(line):
+            kind_match = re.search(r"\b(FAIL|ERROR|FATAL|WARN|PASS)\b|\b(PIPELINE\s+BLOCKED)\b|\b(Retry)\b", line, re.IGNORECASE)
+            kind = next((value for value in kind_match.groups() if value), "EVENT").upper() if kind_match else "EVENT"
+            events.append((line_number, kind, line.strip()))
+    return events
 
 
 st.set_page_config(
@@ -248,6 +290,7 @@ st.markdown(
       .ag-welcome { margin:.15rem auto .2rem; }
       [data-testid="stHorizontalBlock"]:has(.stButton) .stButton > button { min-height:3rem; padding:.55rem .7rem; }
       hr { border-color:#1e304a; }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -271,56 +314,34 @@ with st.sidebar:
         for key in (
             "agentguard_history", "agentguard_result", "agentguard_result_log",
             "agentguard_result_log_text", "agentguard_result_source_label", "agentguard_task",
-            "agentguard_suggested_prompt", "investigation_chat",
+            "agentguard_suggested_prompt", "investigation_chat", "agentguard_report_id",
+            "agentguard_archived_report", "agentguard_archived_metadata", "selected_evidence_line",
         ):
             st.session_state.pop(key, None)
         st.session_state["agentguard_page_target"] = "Investigations"
         st.rerun()
     st.markdown("**Build source**")
-    source_mode = st.radio(
-        "Log source", ["Bundled logs", "Upload my CI log"], horizontal=False,
-        help="Uploaded text logs are processed in memory for this session and are not saved to the project.",
-    )
     uploaded_text = None
     upload_error = None
     uploaded_name = None
-    if source_mode == "Upload my CI log":
-        uploaded_file = st.file_uploader("Upload a CI log (.txt, maximum 1 MB)", type=["txt"])
-        st.caption("The log stays in this session's memory and is not saved to the project. Evidence is retrieved from the selected log, then Ollama synthesizes the answer (local by default).")
-        if uploaded_file is not None:
-            uploaded_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", Path(uploaded_file.name).name)[:120]
-            file_bytes = uploaded_file.getvalue()
-            if len(file_bytes) > MAX_FILE_BYTES:
-                upload_error = "The uploaded log exceeds the 1 MB limit."
-            else:
-                try:
-                    uploaded_text = validate_log_text(file_bytes.decode("utf-8-sig"))
-                except (UnicodeDecodeError, ValueError) as error:
-                    upload_error = f"The upload must be a non-empty UTF-8 text log: {error}"
-        if upload_error:
-            st.error(upload_error)
-        elif uploaded_file is None:
-            st.info("Upload a .txt CI log to start an investigation.")
-
-    approved = set(list_allowed_files())
-    build_choices = {
-        "Historical scikit-learn CI build / 562398767": "logs.txt",
-        "Sample demo log": "sample_logs.txt",
-    }
-    available_choices = {label: name for label, name in build_choices.items() if name in approved}
-    if source_mode == "Bundled logs":
-        if not available_choices:
-            st.error("No supported log files are available in data/.")
-            st.stop()
-        selected_label = st.selectbox("Select a build log", list(available_choices))
-        selected_log = available_choices[selected_label]
-        selected_source_label = f"data/{selected_log}"
-        source_log_text = None
-        if selected_log == "logs.txt":
-            build_id, project_name, build_status = "562398767", "scikit-learn", "Failed"
+    uploaded_file = st.file_uploader("Upload a CI log (.txt, maximum 1 MB)", type=["txt"])
+    st.caption("Uploaded logs stay in session memory. Investigation reports and answers are saved locally with citations; original log files are not stored. Ollama synthesizes the answer (local by default).")
+    if uploaded_file is not None:
+        uploaded_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", Path(uploaded_file.name).name)[:120]
+        file_bytes = uploaded_file.getvalue()
+        if len(file_bytes) > MAX_FILE_BYTES:
+            upload_error = "The uploaded log exceeds the 1 MB limit."
         else:
-            build_id, project_name, build_status = "Sample", "Demo data", "Sample"
-    elif uploaded_text is not None:
+            try:
+                uploaded_text = validate_log_text(file_bytes.decode("utf-8-sig"))
+            except (UnicodeDecodeError, ValueError) as error:
+                upload_error = f"The upload must be a non-empty UTF-8 text log: {error}"
+    if upload_error:
+        st.error(upload_error)
+    elif uploaded_file is None:
+        st.info("Upload a .txt CI log to start an investigation.")
+
+    if uploaded_text is not None:
         selected_log = "logs.txt"  # Tool API fallback; uploaded content takes precedence in memory.
         selected_source_label = f"uploaded log '{uploaded_name}' (temporary)"
         source_log_text = uploaded_text
@@ -339,19 +360,86 @@ with st.sidebar:
         source_log_text = None
         build_id, project_name, build_status = "Uploaded log", "User supplied", "Not provided"
 
-source_ready = source_mode == "Bundled logs" or source_log_text is not None
-source_name = uploaded_name if source_log_text is not None else selected_log if source_mode == "Bundled logs" else "No log uploaded"
+    saved_reports = load_saved_reports()
+    if saved_reports:
+        st.divider()
+        st.markdown("**Saved investigations**")
+        report_by_id = {str(item.get("id")): item for item in saved_reports}
+        chosen_report_id = st.selectbox(
+            "Saved report", list(report_by_id),
+            format_func=lambda report_id: (
+                f"{report_by_id[report_id].get('created_at', 'Saved report')} · "
+                f"{report_by_id[report_id].get('task', 'Investigation')[:42]} · "
+                f"{report_by_id[report_id].get('source_name', 'log')}"
+            ),
+            label_visibility="collapsed", key="saved_report_choice",
+        )
+        delete_col, _ = st.columns([1, 5])
+        with delete_col:
+            delete_selected = st.button(
+                "🗑️ Delete", help="Delete the selected saved investigation",
+                key=f"delete_saved_report_{chosen_report_id}", use_container_width=True,
+            )
+        if delete_selected:
+            remaining_reports = [
+                report for report in saved_reports
+                if str(report.get("id")) != chosen_report_id
+            ]
+            temporary_path = REPORT_HISTORY_PATH.with_suffix(".tmp")
+            try:
+                temporary_path.write_text(
+                    json.dumps(remaining_reports, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary_path.replace(REPORT_HISTORY_PATH)
+                st.session_state.pop("saved_report_choice", None)
+                st.rerun()
+            except OSError as error:
+                st.error(f"Could not delete the saved investigation: {error}")
+        if st.button("Open saved report", use_container_width=True):
+            archived = report_by_id[chosen_report_id]
+            current_fingerprint = hashlib.sha256(source_log_text.encode("utf-8")).hexdigest() if source_log_text else None
+            same_source = current_fingerprint and current_fingerprint == archived.get("source_fingerprint")
+            st.session_state["agentguard_result"] = {
+                "answer": archived.get("answer", ""), "status": archived.get("status", "completed"),
+                "elapsed_seconds": archived.get("elapsed_seconds"), "steps": archived.get("steps", 0),
+                "tool_calls": archived.get("tool_calls", 0),
+                "trace": archived.get("tool_trace", []),
+                "source_fingerprint": archived.get("source_fingerprint"),
+            }
+            st.session_state["agentguard_task"] = archived.get("task", "Saved investigation")
+            st.session_state["agentguard_result_log"] = "logs.txt"
+            st.session_state["agentguard_result_log_text"] = source_log_text if same_source else None
+            st.session_state["agentguard_result_source_label"] = archived.get("source_label", "Saved report source")
+            st.session_state["agentguard_report_id"] = archived.get("id")
+            st.session_state["agentguard_archived_report"] = True
+            st.session_state["agentguard_archived_metadata"] = {
+                "build_id": archived.get("build_id", "Uploaded log"),
+                "project_name": archived.get("project_name", "User supplied"),
+                "build_status": archived.get("build_status", "Not provided"),
+                "source_name": archived.get("source_name", "Saved report source"),
+            }
+            st.session_state["agentguard_page_target"] = "Investigations"
+            st.rerun()
+        st.caption("Reports and answers are stored locally with source citations. Uploaded log files themselves are not saved; re-upload the same log to reopen cited context.")
+
+source_ready = source_log_text is not None
+source_name = uploaded_name if source_log_text is not None else "No log uploaded"
+archived_metadata = st.session_state.get("agentguard_archived_metadata") if st.session_state.get("agentguard_archived_report") else None
+if archived_metadata:
+    build_id = archived_metadata.get("build_id", build_id)
+    project_name = archived_metadata.get("project_name", project_name)
+    build_status = archived_metadata.get("build_status", build_status)
+    source_name = archived_metadata.get("source_name", source_name)
 if source_log_text is not None:
     source_size = len(source_log_text.encode("utf-8"))
     source_kind = f"{source_size / 1024:.1f} KB  /  Uploaded in this session"
-elif source_mode == "Bundled logs":
-    try:
-        source_size = Path("data", selected_log).stat().st_size
-        source_kind = f"{source_size / 1024:.1f} KB  /  Bundled read-only data"
-    except OSError:
-        source_kind = "Bundled read-only data"
+    if archived_metadata:
+        active_fingerprint = hashlib.sha256(source_log_text.encode("utf-8")).hexdigest()
+        if active_fingerprint != st.session_state.get("agentguard_result", {}).get("source_fingerprint"):
+            source_kind = "Saved report · original log not stored"
 else:
-    source_kind = "Waiting for upload"
+    source_kind = "Saved report · original log not stored" if archived_metadata else "Waiting for upload"
 source_indicator = "&#10003;" if source_ready else "!"
 hero_col, source_col = st.columns([2.15, 1], gap="large", vertical_alignment="center")
 with hero_col:
@@ -457,7 +545,7 @@ if page == "Investigations":
     investigate = task is not None
 
     if investigate:
-        if source_mode == "Upload my CI log" and source_log_text is None:
+        if source_log_text is None:
             st.warning("Upload a valid text log before running an investigation.")
         elif not task.strip():
             st.warning("Enter an investigation request first.")
@@ -510,10 +598,52 @@ if page == "Investigations":
                     st.session_state["agentguard_result_log"] = selected_log
                     st.session_state["agentguard_result_log_text"] = source_log_text
                     st.session_state["agentguard_result_source_label"] = selected_source_label
+                    report_id = str(uuid4())
+                    st.session_state["agentguard_report_id"] = report_id
+                    st.session_state["agentguard_archived_report"] = False
+                    report_record = {
+                        "id": report_id,
+                        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                        "task": task,
+                        "answer": result.get("answer", ""),
+                        "status": result.get("status", "completed"),
+                        "elapsed_seconds": result.get("elapsed_seconds"),
+                        "steps": result.get("steps", 0),
+                        "tool_calls": result.get("tool_calls", len(result.get("trace", []))),
+                        "tool_trace": [
+                            {
+                                key: event[key]
+                                for key in ("step", "tool", "arguments", "requested_by")
+                                if key in event
+                            }
+                            | {
+                                "line_numbers": sorted({
+                                    int(match.group(1))
+                                    for item in event.get("result", {}).get("result", [])
+                                    if isinstance(item, str)
+                                    for match in [re.match(r"L(\d+):", item)]
+                                    if match
+                                })
+                            }
+                            for event in result.get("trace", [])
+                        ],
+                        "source_name": uploaded_name or "uploaded log",
+                        "source_label": selected_source_label,
+                        "source_fingerprint": hashlib.sha256(source_log_text.encode("utf-8")).hexdigest(),
+                        "build_id": build_id,
+                        "project_name": project_name,
+                        "build_status": build_status,
+                    }
+                    try:
+                        save_report(report_record)
+                    except OSError as error:
+                        st.warning(f"Report is available for this session, but local history could not be saved: {error}")
                     status.update(label="Investigation complete", state="complete", expanded=False)
                 except Exception as error:
                     status.update(label="Investigation failed", state="error", expanded=True)
                     st.error(f"The investigation could not be completed: {error}")
+                    with st.expander("Technical details", expanded=True):
+                        st.exception(error)
 
 
     # Render archived turns after processing the current input so the latest completed
@@ -571,6 +701,10 @@ if page == "Investigations":
             ) + '</div>',
             unsafe_allow_html=True,
         )
+        st.caption(
+            "Model steps count Ollama turns. Tool calls count evidence tools run by AgentGuard; "
+            "one model step can use several tool calls."
+        )
         if result.get("status") == "completed_with_fallback" and result.get("model_error"):
             st.info(
                 f"Ollama synthesis failed ({result['model_error']}). The report below is an "
@@ -580,13 +714,33 @@ if page == "Investigations":
         st.markdown('<div class="ag-label">Investigation details</div>', unsafe_allow_html=True)
 
         trace = result.get("trace", [])
+        if result_log_text:
+            timeline = log_timeline_events(result_log_text)
+            with st.expander(f"Failure & retry timeline - {len(timeline)} events", expanded=False):
+                if timeline:
+                    st.dataframe(
+                        [{"Line": number, "Event": kind, "Log entry": text}
+                         for number, kind, text in timeline],
+                        use_container_width=True, hide_index=True,
+                        column_config={"Log entry": st.column_config.TextColumn(width="large")},
+                    )
+                else:
+                    st.caption("No failure, retry, warning, or pipeline events were found in this log.")
+        elif st.session_state.get("agentguard_archived_report"):
+            st.info("This saved report does not include the source log. Upload the same file to view its timeline and line context.")
+
         st.markdown('<div class="ag-section" style="margin-top:1.5rem"><span class="ag-step">4</span><span class="ag-section-title">Source log evidence</span></div>', unsafe_allow_html=True)
-        st.markdown('<div class="ag-section-note">Open a cited line to inspect the surrounding log context.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="ag-section-note">Select a line reference to inspect its surrounding source context.</div>', unsafe_allow_html=True)
         matches: set[tuple[str, int]] = set()
         for cited_number in re.findall(r"(?::L|\bL)(\d+)\b", result.get("answer", "")):
             matches.add((result_log, int(cited_number)))
         if not matches:
             for event in trace:
+                matches.update(
+                    (result_log, number)
+                    for number in event.get("line_numbers", [])
+                    if isinstance(number, int) and number > 0
+                )
                 if event.get("tool") != "search_logs":
                     continue
                 payload = event.get("result", {}).get("result", [])
@@ -599,18 +753,34 @@ if page == "Investigations":
                             matches.add((result_log, int(line_match.group(1))))
         if matches:
             ordered_matches = sorted(matches)
-            for filename, line_number in ordered_matches[:30]:
-                with st.expander(f"{result_source_label} · line {line_number}"):
-                    try:
-                        context = get_log_context(
-                            filename, line_number, radius=3, log_text=result_log_text
-                        )
-                        st.code("\n".join(
-                            f"{'>' if row['matched'] else ' '} {row['line']:>6}  {row['text']}"
-                            for row in context
-                        ), language="text")
-                    except (OSError, ValueError) as error:
-                        st.warning(f"Could not load this source context: {error}")
+            visible_matches = ordered_matches[:30]
+            active_line = st.session_state.get("selected_evidence_line")
+            if not any(line_number == active_line for _, line_number in visible_matches):
+                active_line = visible_matches[0][1]
+            for offset in range(0, len(visible_matches), 8):
+                line_cols = st.columns(min(8, len(visible_matches) - offset), gap="small")
+                for col, (filename, line_number) in zip(line_cols, visible_matches[offset:offset + 8]):
+                    with col:
+                        if st.button(
+                            f"L{line_number}",
+                            key=f"cite_{st.session_state.get('agentguard_report_id', 'current')}_{line_number}",
+                            use_container_width=True,
+                            type="primary" if line_number == active_line else "secondary",
+                        ):
+                            st.session_state["selected_evidence_line"] = line_number
+                            st.rerun()
+            if result_log_text:
+                try:
+                    context = get_log_context(result_log, active_line, radius=3, log_text=result_log_text)
+                    st.caption(f"{result_source_label} - line {active_line}")
+                    st.code("\n".join(
+                        f"{'>' if row['matched'] else ' '} {row['line']:>6}  {row['text']}"
+                        for row in context
+                    ), language="text")
+                except (OSError, ValueError) as error:
+                    st.warning(f"Could not load this source context: {error}")
+            else:
+                st.caption("Upload the original log to inspect these saved line citations.")
         else:
             st.caption("No numbered source log lines were retrieved in this investigation.")
         if len(matches) > 30:
@@ -623,18 +793,53 @@ if page == "Investigations":
         if tool_errors:
             st.warning(f"{len(tool_errors)} tool call(s) returned errors. Expand the trace for details.")
 
-        with st.expander(f"Evidence trace · {len(trace)} tool call(s)", expanded=False):
+        tool_call_count = result.get("tool_calls", len(trace))
+        with st.expander(f"Tools called · {tool_call_count} call(s)", expanded=True):
             if trace:
-                st.dataframe(trace, use_container_width=True, hide_index=True)
-                st.code(json.dumps(trace, indent=2, ensure_ascii=False), language="json")
+                call_rows = []
+                for call_number, event in enumerate(trace, start=1):
+                    tool_result = event.get("result", {})
+                    payload = tool_result.get("result") if isinstance(tool_result, dict) else None
+                    if "result" not in event:
+                        outcome = "Tool name saved; evidence result not stored"
+                    elif isinstance(tool_result, dict) and "error" in tool_result:
+                        outcome = f"Error: {tool_result['error']}"
+                    elif isinstance(payload, list):
+                        found = [
+                            item for item in payload
+                            if isinstance(item, str) and not item.startswith("No matching")
+                        ]
+                        outcome = f"{len(found)} matching line(s)" if found else "No matches"
+                    elif isinstance(payload, dict):
+                        outcome = "Counts available" if payload.get("available") else "Summary returned"
+                    else:
+                        outcome = "Result returned"
+                    call_rows.append({
+                        "Call": call_number,
+                        "Tool": event.get("tool", "Unknown tool"),
+                        "Arguments": json.dumps(event.get("arguments", {}), ensure_ascii=False),
+                        "Called by": "Harness" if event.get("requested_by") == "harness_followup" else "Model",
+                        "Result": outcome,
+                    })
+                st.dataframe(call_rows, use_container_width=True, hide_index=True)
             else:
-                st.caption("No tool calls were recorded for this request.")
+                if tool_call_count:
+                    st.caption(
+                        f"This saved report records {tool_call_count} tool calls, but their names "
+                        "were not stored in the older report."
+                    )
+                else:
+                    st.caption("No tool calls were recorded for this request.")
 
         if st.button("Clear report"):
             st.session_state.pop("agentguard_result", None)
             st.session_state.pop("agentguard_result_log", None)
             st.session_state.pop("agentguard_result_log_text", None)
             st.session_state.pop("agentguard_result_source_label", None)
+            st.session_state.pop("agentguard_report_id", None)
+            st.session_state.pop("agentguard_archived_report", None)
+            st.session_state.pop("agentguard_archived_metadata", None)
+            st.session_state.pop("selected_evidence_line", None)
             st.rerun()
 elif page == "Overview":
     st.markdown("### Overview")
@@ -666,6 +871,10 @@ elif page == "Evidence":
         }
         if not evidence_lines:
             for event in evidence_trace:
+                evidence_lines.update(
+                    number for number in event.get("line_numbers", [])
+                    if isinstance(number, int) and number > 0
+                )
                 if event.get("tool") != "search_logs":
                     continue
                 payload = event.get("result", {}).get("result", [])

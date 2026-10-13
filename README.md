@@ -30,6 +30,8 @@ Set these environment variables before starting the app or evaluator:
 | `AGENTGUARD_MAX_CONTEXT_CHARS` | `100000` | Maximum accumulated conversation size |
 | `AGENTGUARD_MODEL_TIMEOUT` | `90` | Ollama request timeout, in seconds |
 | `AGENTGUARD_MODEL_RETRIES` | `1` | Retries after a model request error |
+| `AGENTGUARD_SYNTHESIS_TIMEOUT` | `180` | Ollama report-writing timeout, in seconds |
+| `AGENTGUARD_MAX_SYNTHESIS_TOKENS` | `1800` | Maximum tokens Ollama can generate for an investigation report (128–8192) |
 
 ## Design and controls
 

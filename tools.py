@@ -204,20 +204,19 @@ def extract_failure_evidence(
             score += 80
         if re.search(r"\bERROR\b|\bFATAL\b", line, re.IGNORECASE):
             score += 75
-        if any(term in low for term in (
-            "pipeline blocked", "blocking conditions", "security policy violation",
-            "backward-incompatible", "test summary", "build status: failed",
-        )):
-            score += 90
-        if any(term in low for term in (
-            "expected invariant", "actual:", "expected:", "recommended sequence:",
-            "patched version:", "default jwt", "retry succeeded", "succeeded on retry",
-        )):
+        if re.search(r"\b(?:blocked|cancelled|canceled)\b", low):
+            score += 70
+        if re.search(
+            r"\b(?:expected|actual|observed|found|detected)\b\s*[:=]|"
+            r"\b(?:retry|attempt)\b.{0,40}\b(?:succeed|success|pass)\w*|"
+            r"\b(?:succeed|success|pass)\w*.{0,40}\b(?:retry|attempt)\b",
+            low,
+        ):
             score += 55
         if re.search(r"\b(?:retry|attempt)\b.*\b(?:succeed|success|pass)\w*|\b(?:succeed|success|pass)\w*.*\b(?:retry|attempt)\b", low):
             score += 55
         if re.search(r"\bWARN(?:ING)?\b", line, re.IGNORECASE):
-            score -= 45
+            score += 45
         if re.search(r"\bPASS\b", line, re.IGNORECASE):
             score -= 25
         if score >= 45:
